@@ -75,7 +75,7 @@ jobs:
                   bad = zf.testzip()
                   if bad is not None:
                       raise SystemExit(f"{label}: CRC error in {bad!r}")
-                  return zf, files, total
+                  return zipfile.ZipFile(io.BytesIO(data)), files, total
 
           outer_hash = hashlib.sha256(raw).hexdigest()
           outer, outer_files, outer_expanded = validate_zip(
