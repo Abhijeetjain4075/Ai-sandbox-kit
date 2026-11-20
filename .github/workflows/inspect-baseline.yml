@@ -1,0 +1,135 @@
+name: Inspect v3.3.0 baseline archive
+
+on:
+  push:
+    branches:
+      - v3.5.0
+    paths:
+      - .github/workflows/inspect-baseline.yml
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: baseline-inspection-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  inspect-baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Validate and stage the v3.3.0 archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import shutil
+          import stat
+          import zipfile
+
+          repo = pathlib.Path.cwd()
+          source = repo / "ai-sandbox-kit-v3.3.0-validated-candidate.zip"
+          out = repo / "audit-output"
+          extracted = out / "extracted"
+          out.mkdir()
+          if not source.is_file():
+              raise SystemExit("Expected v3.3.0 archive is missing")
+          data = source.read_bytes()
+          if len(data) > 64 * 1024 * 1024:
+              raise SystemExit("Archive exceeds the 64 MiB inspection cap")
+          digest = hashlib.sha256(data).hexdigest()
+          with zipfile.ZipFile(source) as zf:
+              infos = zf.infolist()
+              names = [i.filename for i in infos]
+              if len(names) != len(set(names)):
+                  raise SystemExit("Duplicate ZIP entry names detected")
+              total = 0
+              for info in infos:
+                  name = info.filename
+                  p = pathlib.PurePosixPath(name)
+                  mode = info.external_attr >> 16
+                  if p.is_absolute() or ".." in p.parts or "\\\\" in name:
+                      raise SystemExit(f"Unsafe archive path: {name!r}")
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f"Symlink entry rejected: {name!r}")
+                  total += info.file_size
+                  if total > 256 * 1024 * 1024:
+                      raise SystemExit("Expanded archive exceeds the 256 MiB cap")
+              bad = zf.testzip()
+              if bad is not None:
+                  raise SystemExit(f"CRC failure in archive member: {bad}")
+              zf.extractall(extracted)
+          shutil.copy2(source, out / source.name)
+          source_tree = sorted(
+              str(p.relative_to(extracted))
+              for p in extracted.rglob("*") if p.is_file()
+          )
+          py_files = [x for x in source_tree if x.endswith(".py")]
+          pyproject = next((extracted / x for x in source_tree if x.endswith("pyproject.toml")), None)
+          readmes = [x for x in source_tree if pathlib.PurePosixPath(x).name.lower().startswith("readme")]
+          report = {
+              "archive": source.name,
+              "sha256": digest,
+              "archive_bytes": len(data),
+              "entry_count": len(infos),
+              "expanded_bytes": total,
+              "source_file_count": len(source_tree),
+              "python_file_count": len(py_files),
+              "python_files": py_files,
+              "readmes": readmes,
+              "pyproject_path": str(pyproject.relative_to(extracted)) if pyproject else None,
+              "entries": [
+                  {"path": i.filename, "size": i.file_size, "compressed_size": i.compress_size}
+                  for i in infos
+              ],
+          }
+          (out / "archive-inspection.json").write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\\n",
+              encoding="utf-8"
+          )
+          print(json.dumps({k: report[k] for k in (
+              "archive", "sha256", "archive_bytes", "entry_count",
+              "expanded_bytes", "source_file_count", "python_file_count",
+              "pyproject_path", "readmes"
+          )}, indent=2))
+          PY
+
+      - name: Compile Python sources without executing project code
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q audit-output/extracted
+          echo "Python bytecode compilation passed"
+
+      - name: Package source archive and inventory for local review
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib
+          import zipfile
+          root = pathlib.Path("audit-output/extracted")
+          with zipfile.ZipFile("audit-output/v3.3.0-extracted-source.zip", "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for p in sorted(root.rglob("*")):
+                  if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc":
+                      zf.write(p, p.relative_to(root))
+          PY
+
+      - name: Upload short-lived inspection evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: v3.3.0-baseline-inspection
+          path: audit-output/
+          if-no-files-found: error
+          retention-days: 1
