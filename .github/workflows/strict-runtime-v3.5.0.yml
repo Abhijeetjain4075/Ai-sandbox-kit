@@ -1,0 +1,231 @@
+name: Run v3.5.0 strict sandbox probe
+
+on:
+  push:
+    branches:
+      - sandbox/bootstrap-v3.5.0-20261120
+    paths:
+      - .github/workflows/strict-runtime-v3.5.0.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v35-strict-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  strict-runtime:
+    name: Install and verify strict bwrap backend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact temporary branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install bubblewrap on the disposable VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          command -v bwrap
+          bwrap --version
+          command -v unshare
+
+      - name: Verify and safely extract exact v3.5.0 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import pathlib
+          import re
+          import stat
+          import zipfile
+
+          outer_path = pathlib.Path("AI-SANDBOX-KIT-v3.5.0-RELEASE-BUNDLE.zip")
+          if not outer_path.is_file():
+              raise SystemExit("missing v3.5.0 release bundle")
+          outer_bytes = outer_path.read_bytes()
+          if len(outer_bytes) > 32 * 1024 * 1024:
+              raise SystemExit("outer archive exceeds limit")
+
+          def inspect(data, label, max_entries, max_expanded):
+              zf = zipfile.ZipFile(io.BytesIO(data))
+              infos = zf.infolist()
+              names = [x.filename for x in infos]
+              if len(names) != len(set(names)):
+                  raise SystemExit(f"{label}: duplicate ZIP paths")
+              if len(infos) > max_entries:
+                  raise SystemExit(f"{label}: entry count limit exceeded")
+              total = 0
+              for item in infos:
+                  name = item.filename
+                  path = pathlib.PurePosixPath(name)
+                  mode = item.external_attr >> 16
+                  if path.is_absolute() or ".." in path.parts or chr(92) in name or "\x00" in name:
+                      raise SystemExit(f"{label}: unsafe path {name!r}")
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f"{label}: symlink entry rejected {name!r}")
+                  if item.file_size > 128 * 1024 * 1024:
+                      raise SystemExit(f"{label}: oversized member {name!r}")
+                  total += item.file_size
+                  if total > max_expanded:
+                      raise SystemExit(f"{label}: expanded size limit exceeded")
+              bad = zf.testzip()
+              if bad is not None:
+                  raise SystemExit(f"{label}: CRC failure in {bad!r}")
+              return zf, total
+
+          outer, outer_total = inspect(outer_bytes, "outer release", 1000, 128 * 1024 * 1024)
+          try:
+              nested = [n for n in outer.namelist()
+                        if pathlib.PurePosixPath(n).name == "ai-sandbox-kit-3.5.0.zip"]
+              sums = [n for n in outer.namelist()
+                      if pathlib.PurePosixPath(n).name == "SHA256SUMS.txt"]
+              if len(nested) != 1 or len(sums) != 1:
+                  raise SystemExit("expected exactly one inner archive and checksum file")
+              inner_bytes = outer.read(nested[0])
+              checksum_text = outer.read(sums[0]).decode("ascii")
+          finally:
+              outer.close()
+
+          actual = hashlib.sha256(inner_bytes).hexdigest()
+          expected = None
+          for line in checksum_text.splitlines():
+              parts = line.split()
+              if len(parts) == 2 and pathlib.PurePosixPath(parts[1].lstrip("*")).name == "ai-sandbox-kit-3.5.0.zip":
+                  expected = parts[0].lower()
+          if expected is None or expected != actual:
+              raise SystemExit("inner archive SHA-256 missing or mismatched")
+
+          inner, inner_total = inspect(inner_bytes, "inner kit", 5000, 256 * 1024 * 1024)
+          try:
+              names = inner.namelist()
+              roots = {pathlib.PurePosixPath(n).parts[0]
+                       for n in names if pathlib.PurePosixPath(n).parts}
+              if roots != {"ai-sandbox-kit-3.5.0"}:
+                  raise SystemExit(f"unexpected inner archive root: {sorted(roots)}")
+              version = inner.read("ai-sandbox-kit-3.5.0/VERSION").decode("ascii").strip()
+              if version != "3.5.0":
+                  raise SystemExit(f"unexpected VERSION: {version!r}")
+              destination = pathlib.Path("v35-source")
+              destination.mkdir()
+              for item in inner.infolist():
+                  rel = pathlib.PurePosixPath(item.filename)
+                  target = destination.joinpath(*rel.parts)
+                  if item.is_dir():
+                      target.mkdir(parents=True, exist_ok=True)
+                  else:
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with inner.open(item) as src, target.open("xb") as dst:
+                          while chunk := src.read(1024 * 1024):
+                              dst.write(chunk)
+          finally:
+              inner.close()
+
+          root = pathlib.Path("v35-source/ai-sandbox-kit-3.5.0")
+          print(f"version={version}")
+          print(f"inner_sha256={actual}")
+          print(f"inner_entries={len(names)}")
+          print(f"inner_expanded_bytes={inner_total}")
+          print(f"python_sources={len(list(root.rglob('*.py')))}")
+          PY
+
+      - name: Verify Python package and default policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE/v35-source/ai-sandbox-kit-3.5.0"
+          python3 -m sandboxkit.cli --version
+          python3 -m sandboxkit.cli policy-check --policy "$GITHUB_WORKSPACE/v35-source/ai-sandbox-kit-3.5.0/policies/default.json"
+          python3 -m compileall -q "$GITHUB_WORKSPACE/v35-source/ai-sandbox-kit-3.5.0/sandboxkit"
+
+      - name: Require strict backend and inspect host capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE/v35-source/ai-sandbox-kit-3.5.0"
+          python3 -m sandboxkit.cli doctor | tee "$RUNNER_TEMP/v35-doctor.json"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path(__import__("os").environ["RUNNER_TEMP"] + "/v35-doctor.json").read_text())
+          assert report.get("bwrap"), "bubblewrap not found"
+          assert report.get("bwrap_preflight") == "available", report.get("bwrap_preflight")
+          assert report.get("strict_backend_available") is True, report
+          assert report.get("userns_preflight") == "available", report.get("userns_preflight")
+          print("strict backend availability: VERIFIED")
+          PY
+
+      - name: Execute strict no-network sandbox smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE/v35-source/ai-sandbox-kit-3.5.0"
+          WORKSPACE="$RUNNER_TEMP/v35-workspace"
+          STATE="$RUNNER_TEMP/v35-state"
+          HOST_SENTINEL="$RUNNER_TEMP/v35-host-only.txt"
+          mkdir -p "$WORKSPACE"
+          printf 'host-only sentinel\n' > "$HOST_SENTINEL"
+
+          PROBE=$(cat <<PYCODE
+          import json, pathlib, socket
+          status = {}
+          for line in pathlib.Path('/proc/self/status').read_text().splitlines():
+              if ':' in line:
+                  key, value = line.split(':', 1)
+                  status[key] = value.strip()
+          interfaces = sorted(name for _, name in socket.if_nameindex())
+          host_sentinel_visible = pathlib.Path('$HOST_SENTINEL').exists()
+          home = __import__('os').environ.get('HOME')
+          pathlib.Path('strict-smoke.txt').write_text('strict-bwrap-ok', encoding='utf-8')
+          result = {
+              'interfaces': interfaces,
+              'seccomp': status.get('Seccomp'),
+              'no_new_privs': status.get('NoNewPrivs'),
+              'host_sentinel_visible': host_sentinel_visible,
+              'home': home,
+          }
+          print(json.dumps(result, sort_keys=True))
+          assert interfaces == ['lo'], result
+          assert status.get('Seccomp') == '2', result
+          assert status.get('NoNewPrivs') == '1', result
+          assert host_sentinel_visible is False, result
+          assert home == '/tmp/home', result
+          PYCODE
+          )
+
+          python3 -m sandboxkit.cli run \
+            --workspace "$WORKSPACE" \
+            --policy "$GITHUB_WORKSPACE/v35-source/ai-sandbox-kit-3.5.0/policies/default.json" \
+            --state-dir "$STATE" \
+            -- python3 -c "$PROBE" > "$RUNNER_TEMP/v35-run-result.json"
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          result = json.loads(Path(os.environ["RUNNER_TEMP"] + "/v35-run-result.json").read_text())
+          assert result["returncode"] == 0, result
+          assert result["stop_reason"] is None, result
+          assert Path(os.environ["RUNNER_TEMP"] + "/v35-workspace/strict-smoke.txt").read_text() == "strict-bwrap-ok"
+          print("strict bwrap task: PASS")
+          print(json.dumps(result, indent=2))
+          PY
+
+      - name: Upload strict runtime evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: v3.5.0-strict-runtime-evidence
+          path: |
+            ${{ runner.temp }}/v35-doctor.json
+            ${{ runner.temp }}/v35-run-result.json
+          if-no-files-found: warn
+          retention-days: 1
