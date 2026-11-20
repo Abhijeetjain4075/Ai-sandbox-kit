@@ -35,6 +35,17 @@ jobs:
           command -v bwrap
           bwrap --version
           command -v unshare
+          mkdir -p "$RUNNER_TEMP/bwrap-transfer"
+          cd "$RUNNER_TEMP/bwrap-transfer"
+          apt-get download bubblewrap
+          DEB="$(find . -maxdepth 1 -name 'bubblewrap_*.deb' -print -quit)"
+          test -n "$DEB"
+          dpkg-deb -f "$DEB" Package Version Architecture > package-metadata.txt
+          sha256sum "$DEB" > package.sha256
+          apt-cache show bubblewrap | awk '/^SHA256:/{print $2; exit}' > package-index.sha256
+          dpkg-deb -x "$DEB" rootfs
+          ldd /usr/bin/bwrap > bwrap.ldd
+          cp /usr/bin/bwrap bwrap
 
       - name: Verify and safely extract exact v3.5.0 source
         shell: bash
@@ -227,5 +238,6 @@ jobs:
           path: |
             ${{ runner.temp }}/v35-doctor.json
             ${{ runner.temp }}/v35-run-result.json
+            ${{ runner.temp }}/bwrap-transfer/
           if-no-files-found: warn
           retention-days: 1
