@@ -1,0 +1,182 @@
+name: Bootstrap v3.5.0 release bundle
+
+on:
+  push:
+    branches:
+      - sandbox/bootstrap-v3.5.0-20261120
+    paths:
+      - .github/workflows/bootstrap-v3.5.0.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: exon-sandbox-bootstrap-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  inspect-and-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact branch commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Validate archive structure without executing kit code
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import stat
+          import zipfile
+
+          source = pathlib.Path("AI-SANDBOX-KIT-v3.5.0-RELEASE-BUNDLE.zip")
+          out = pathlib.Path("audit-output")
+          out.mkdir()
+          if not source.is_file():
+              raise SystemExit("v3.5.0 release bundle is missing")
+          raw = source.read_bytes()
+          if len(raw) > 32 * 1024 * 1024:
+              raise SystemExit("Outer release bundle exceeds 32 MiB limit")
+
+          def validate_zip(data, label, max_total, max_entries):
+              import io
+              with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                  infos = zf.infolist()
+                  names = [i.filename for i in infos]
+                  if len(names) != len(set(names)):
+                      raise SystemExit(f"{label}: duplicate ZIP member names")
+                  if len(infos) > max_entries:
+                      raise SystemExit(f"{label}: too many archive entries")
+                  total = 0
+                  files = []
+                  for info in infos:
+                      name = info.filename
+                      p = pathlib.PurePosixPath(name)
+                      mode = info.external_attr >> 16
+                      if p.is_absolute() or ".." in p.parts or chr(92) in name:
+                          raise SystemExit(f"{label}: unsafe path {name!r}")
+                      if stat.S_ISLNK(mode):
+                          raise SystemExit(f"{label}: symlink rejected {name!r}")
+                      if info.file_size > 64 * 1024 * 1024:
+                          raise SystemExit(f"{label}: oversized member {name!r}")
+                      total += info.file_size
+                      if total > max_total:
+                          raise SystemExit(f"{label}: expansion limit exceeded")
+                      files.append({"path": name, "size": info.file_size,
+                                    "compressed_size": info.compress_size})
+                  bad = zf.testzip()
+                  if bad is not None:
+                      raise SystemExit(f"{label}: CRC error in {bad!r}")
+                  return zf, files, total
+
+          outer_hash = hashlib.sha256(raw).hexdigest()
+          outer, outer_files, outer_expanded = validate_zip(
+              raw, "outer bundle", 128 * 1024 * 1024, 1000
+          )
+          with outer:
+              nested_candidates = [x.filename for x in outer.infolist()
+                                   if pathlib.PurePosixPath(x.filename).name
+                                   == "ai-sandbox-kit-3.5.0.zip"]
+              if len(nested_candidates) != 1:
+                  raise SystemExit(
+                      f"expected one inner v3.5.0 zip, got {nested_candidates!r}"
+                  )
+              prefix = pathlib.PurePosixPath(nested_candidates[0]).parent
+              inner_bytes = outer.read(nested_candidates[0])
+              readme_candidates = [x.filename for x in outer.infolist()
+                                   if pathlib.PurePosixPath(x.filename).name
+                                   == "README-v3.5.0.md"]
+              version_candidates = [x.filename for x in outer.infolist()
+                                    if pathlib.PurePosixPath(x.filename).name == "VERSION"]
+              checksum_candidates = [x.filename for x in outer.infolist()
+                                     if pathlib.PurePosixPath(x.filename).name
+                                     == "SHA256SUMS.txt"]
+              manifest_candidates = [x.filename for x in outer.infolist()
+                                     if pathlib.PurePosixPath(x.filename).name
+                                     == "RELEASE-MANIFEST.json"]
+              readme = outer.read(readme_candidates[0]).decode("utf-8", "replace") if readme_candidates else ""
+              version = outer.read(version_candidates[0]).decode("utf-8", "replace").strip() if version_candidates else None
+              checksum_text = outer.read(checksum_candidates[0]).decode("utf-8", "replace") if checksum_candidates else ""
+              manifest_text = outer.read(manifest_candidates[0]).decode("utf-8", "replace") if manifest_candidates else ""
+
+          inner_hash = hashlib.sha256(inner_bytes).hexdigest()
+          inner, inner_files, inner_expanded = validate_zip(
+              inner_bytes, "inner kit archive", 256 * 1024 * 1024, 5000
+          )
+          with inner:
+              inner_names = [x.filename for x in inner.infolist()]
+              top_levels = sorted({pathlib.PurePosixPath(n).parts[0]
+                                   for n in inner_names if pathlib.PurePosixPath(n).parts})
+              python_files = [n for n in inner_names if n.endswith(".py")]
+              scripts = [n for n in inner_names if
+                         pathlib.PurePosixPath(n).name in
+                         {"install.sh", "setup.sh", "bootstrap.sh", "run.sh"}]
+              project_metadata = [n for n in inner_names if
+                                  pathlib.PurePosixPath(n).name in
+                                  {"pyproject.toml", "requirements.txt", "requirements.lock",
+                                   "Pipfile", "Makefile", "Dockerfile"}]
+
+          # Verify a checksum line for the nested archive when the release manifest supplies one.
+          expected = None
+          for line in checksum_text.splitlines():
+              m = re.match(r"^([0-9a-fA-F]{64})\\s+[* ]?(.+?)\\s*$", line)
+              if m and pathlib.PurePosixPath(m.group(2).lstrip("*")).name == "ai-sandbox-kit-3.5.0.zip":
+                  expected = m.group(1).lower()
+          if expected and expected != inner_hash:
+              raise SystemExit("Inner archive SHA-256 does not match SHA256SUMS.txt")
+
+          report = {
+              "version_file": version,
+              "outer_archive": source.name,
+              "outer_sha256": outer_hash,
+              "outer_bytes": len(raw),
+              "outer_entry_count": len(outer_files),
+              "outer_expanded_bytes": outer_expanded,
+              "inner_archive": nested_candidates[0],
+              "inner_sha256": inner_hash,
+              "inner_bytes": len(inner_bytes),
+              "inner_entry_count": len(inner_files),
+              "inner_expanded_bytes": inner_expanded,
+              "inner_top_level_paths": top_levels,
+              "python_file_count": len(python_files),
+              "python_files": python_files[:250],
+              "bootstrap_script_candidates": scripts,
+              "project_metadata_files": project_metadata,
+              "checksum_declared_for_inner_archive": expected is not None,
+              "checksum_verified": expected == inner_hash if expected else None,
+              "release_readme_excerpt": readme[:5000],
+              "release_manifest_excerpt": manifest_text[:5000],
+          }
+          (out / "release-inspection.json").write_text(
+              json.dumps(report, indent=2, sort_keys=True) + chr(10), encoding="utf-8"
+          )
+          (out / "SHA256SUMS.txt").write_text(checksum_text, encoding="utf-8")
+          (out / "release-manifest.json").write_text(manifest_text, encoding="utf-8")
+          (out / source.name).write_bytes(raw)
+          (out / "ai-sandbox-kit-3.5.0.zip").write_bytes(inner_bytes)
+          print(json.dumps({
+              k: report[k] for k in (
+                  "version_file", "outer_sha256", "outer_bytes", "outer_entry_count",
+                  "inner_sha256", "inner_bytes", "inner_entry_count",
+                  "python_file_count", "bootstrap_script_candidates",
+                  "project_metadata_files", "checksum_declared_for_inner_archive",
+                  "checksum_verified"
+              )
+          }, indent=2))
+          PY
+
+      - name: Upload verified transfer artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: exon-v3.5.0-bootstrap-transfer
+          path: audit-output/
+          if-no-files-found: error
+          retention-days: 1
