@@ -59,7 +59,7 @@ jobs:
                   name = info.filename
                   p = pathlib.PurePosixPath(name)
                   mode = info.external_attr >> 16
-                  if p.is_absolute() or ".." in p.parts or "\\\\" in name:
+                  if p.is_absolute() or ".." in p.parts or chr(92) in name:
                       raise SystemExit(f"Unsafe archive path: {name!r}")
                   if stat.S_ISLNK(mode):
                       raise SystemExit(f"Symlink entry rejected: {name!r}")
@@ -95,7 +95,7 @@ jobs:
               ],
           }
           (out / "archive-inspection.json").write_text(
-              json.dumps(report, indent=2, sort_keys=True) + "\\n",
+              json.dumps(report, indent=2, sort_keys=True) + chr(10),
               encoding="utf-8"
           )
           print(json.dumps({k: report[k] for k in (
